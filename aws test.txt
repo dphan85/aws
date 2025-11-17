@@ -1,0 +1,406 @@
+import os
+import re
+import io
+import csv
+import json
+import boto3
+import zipfile
+import logging
+import urllib.parse
+from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+from typing import Optional, Dict
+import html  # for HTML escaping
+
+# ----------------------------
+# Configure Logging
+# ----------------------------
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# ----------------------------
+# Environment / Constants
+# ----------------------------
+# DEFAULT_SENDER_EMAIL = "duong.phan@cenitex.vic.gov.au" #<<unhash for hardcode
+# DEFAULT_DEST_EMAIL = "duong.phan@cenitex.vic.gov.au" #<<unhash for hardcode
+
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL") #<< "add DEFAULT_SENDER_EMAIL to used hardcoded email above"
+DEST_EMAIL = os.environ.get("DEST_EMAIL") #<< "add DEFAULT_SENDER_EMAIL to used hardcoded email above"
+RECIPIENTS = [DEST_EMAIL]
+
+ENHANCED_OUTPUT_BUCKET = os.environ.get("ENHANCED_OUTPUT_BUCKET", "ctx-awsvicgovdev01-backupreports")
+ENHANCED_OUTPUT_PREFIX = os.environ.get("ENHANCED_OUTPUT_PREFIX", "CombinedReportsTest/awsreport8am/")
+
+BACKUP_REGEX = re.compile(r".*combinedreports.*/.*backup.*\.(csv|zip)$", re.IGNORECASE)
+
+env = os.environ.get("ENVIRONMENT", "DEV")  # default to DEV if not set
+
+# ----------------------------
+# AWS Clients
+# ----------------------------
+s3 = boto3.client("s3")
+ses = boto3.client("ses", region_name="ap-southeast-2")
+org = boto3.client("organizations")
+
+# ----------------------------
+# Helper Functions
+# ----------------------------
+def is_backup_report(key: str) -> bool:
+    return bool(BACKUP_REGEX.match(key))
+
+def get_latest_backup_file(bucket: str) -> Optional[str]:
+    paginator = s3.get_paginator("list_objects_v2")
+    all_files = []
+    for page in paginator.paginate(Bucket=bucket):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if is_backup_report(key):
+                all_files.append({"key": key, "last_modified": obj["LastModified"]})
+    if not all_files:
+        return None
+    all_files.sort(key=lambda x: x["last_modified"], reverse=True)
+    return all_files[0]["key"]
+
+def extract_csv_from_zip(zip_bytes: bytes) -> str:
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        for name in z.namelist():
+            if name.lower().endswith(".csv"):
+                with z.open(name) as f:
+                    return f.read().decode("utf-8")
+    raise ValueError("ZIP does not contain a CSV file")
+
+def get_account_names() -> Dict[str, str]:
+    account_map = {}
+    paginator = org.get_paginator("list_accounts")
+    for page in paginator.paginate():
+        for acct in page["Accounts"]:
+            account_map[acct["Id"]] = acct["Name"]
+    return account_map
+
+def extract_resource_name(row: Dict[str, str]) -> str:
+    for k, v in row.items():
+        if not v:
+            continue
+        if re.search(r"(name|resource[_ ]?name|tag:.*name)", k, re.IGNORECASE):
+            v = v.strip()
+            if not re.search(r"(backupvault|vault)", v, re.IGNORECASE):
+                return v
+    arn = row.get("ResourceArn") or row.get("resourcearn")
+    if arn:
+        parts = arn.split(":")
+        if len(parts) >= 6:
+            resource_part = parts[5]
+            return resource_part.split("/")[-1].strip()
+    for v in row.values():
+        if not v:
+            continue
+        v_str = str(v).strip()
+        if re.match(r"^(i-|fs-|vol-|db-|snap-)", v_str):
+            return v_str
+    for v in row.values():
+        if v and str(v).strip():
+            return str(v).strip()
+    return "backup-resource"
+
+EXCLUDE_COLUMNS = [
+    "Report Time Period Start",
+    "Report Time Period End",
+    "Path to Root"
+]
+
+def enhance_csv(csv_content: str) -> str:
+    account_names = get_account_names()
+    reader = csv.DictReader(io.StringIO(csv_content))
+    rows = list(reader)
+
+    enhanced_rows = []
+    for row in rows:
+        enhanced = {}
+        enhanced["Name"] = extract_resource_name(row)
+        for k, v in row.items():
+            if k in EXCLUDE_COLUMNS:
+                continue
+            v_str = str(v).strip() if isinstance(v, str) else v
+            if "account" in k.lower() and "id" in k.lower():
+                enhanced[k] = f"'{v_str}" if v_str.isdigit() else v_str
+                if v_str in account_names:
+                    enhanced[k.replace("ID", "Name")] = account_names[v_str]
+
+            elif "job" in k.lower() and "status" in k.lower():
+                v_lower = str(v).strip().lower()
+                if v_lower == "completed":
+                    enhanced[k] = "Successful"
+                elif v_lower in ["completed with errors", "success with errors", "completed w/ errors"]:
+                    enhanced[k] = "Successful with errors"
+                elif v_lower == "failed":
+                    enhanced[k] = "Failed"
+                elif v_lower == "running":
+                    enhanced[k] = "Running"
+                elif not v_lower or v_lower in ["unknown", "n/a"]:
+                    enhanced[k] = "Unknown"
+                else:
+                    enhanced[k] = "Unknown"
+
+            elif isinstance(v, str) and "T" in v and "Z" in v:
+                try:
+                    dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                    enhanced[k] = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                except:
+                    enhanced[k] = v_str
+            else:
+                enhanced[k] = v_str
+        enhanced_rows.append(enhanced)
+
+    fieldnames = ["Name"] + [f for f in enhanced_rows[0].keys() if f != "Name"]
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(enhanced_rows)
+
+    return output.getvalue()
+
+def upload_enhanced_csv(content: str, filename: str) -> str:
+    key = f"{ENHANCED_OUTPUT_PREFIX}{filename}"
+    s3.put_object(
+        Bucket=ENHANCED_OUTPUT_BUCKET,
+        Key=key,
+        Body=content.encode("utf-8"),
+        ContentType="text/csv"
+    )
+    return key
+
+# ----------------------------
+# HTML Table Helpers
+# ----------------------------
+def generate_status_summary_table(csv_content: str) -> str:
+    reader = csv.DictReader(io.StringIO(csv_content))
+    status_counts = {}
+    status_colors = {
+        "Successful": "#d4edda",
+        "Successful with errors": "#fff3cd",
+        "Failed": "#f8d7da",
+        "Running": "#d1ecf1",
+        "Other": "#f5f5f5"
+    }
+
+    for row in reader:
+        status = None
+        for k in row:
+            if "job" in k.lower() and "status" in k.lower():
+                status = row[k]
+                break
+        if not status:
+            status = "Other"
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    html_output = ['<table border="1" cellpadding="4" cellspacing="0" style="border-collapse: collapse;">']
+    html_output.append("<thead><tr><th>Status</th><th>Count</th></tr></thead><tbody>")
+
+    for status in ["Successful", "Successful with errors", "Failed", "Running", "Other"]:
+        count = status_counts.get(status, 0)
+        color = status_colors.get(status, "#f5f5f5")
+        html_output.append(f'<tr style="background-color:{color}"><td>{html.escape(status)}</td><td>{count}</td></tr>')
+
+    html_output.append("</tbody></table>")
+    return "".join(html_output)
+
+def csv_to_html_table(csv_content: str, max_rows: int = 50) -> str:
+    reader = csv.reader(io.StringIO(csv_content))
+    rows = list(reader)
+    if not rows:
+        return "<p>No data available</p>"
+
+    html_output = ['<details open>']
+    html_output.append('<summary>Preview of Enhanced CSV (first 50 rows)</summary>')
+    html_output.append('<table border="1" cellpadding="4" cellspacing="0" style="border-collapse: collapse;">')
+
+    html_output.append("<thead><tr>")
+    for col in rows[0]:
+        html_output.append(f"<th>{html.escape(col)}</th>")
+    html_output.append("</tr></thead>")
+
+    html_output.append("<tbody>")
+    for row in rows[1:max_rows+1]:
+        html_output.append("<tr>")
+        for cell in row:
+            html_output.append(f"<td>{html.escape(cell)}</td>")
+        html_output.append("</tr>")
+    if len(rows) > max_rows + 1:
+        html_output.append(f'<tr><td colspan="{len(rows[0])}">... ({len(rows)-max_rows} more rows)</td></tr>')
+    html_output.append("</tbody></table>")
+    html_output.append('</details>')
+
+    return "".join(html_output)
+
+def generate_full_html_attachment(csv_content: str, original_key: str, filename_csv: str, env: str = "DEV") -> str:
+    summary_table = generate_status_summary_table(csv_content)
+    reader = csv.reader(io.StringIO(csv_content))
+    rows = list(reader)
+    max_rows = 1000
+
+    html_output = ['<table border="1" cellpadding="4" cellspacing="0" style="border-collapse: collapse;">']
+    html_output.append("<thead><tr>")
+    for col in rows[0]:
+        html_output.append(f"<th>{html.escape(col)}</th>")
+    html_output.append("</tr></thead>")
+
+    html_output.append("<tbody>")
+    for row in rows[1:max_rows+1]:
+        html_output.append("<tr>")
+        for cell in row:
+            html_output.append(f"<td>{html.escape(cell)}</td>")
+        html_output.append("</tr>")
+    if len(rows) > max_rows + 1:
+        html_output.append(f'<tr><td colspan="{len(rows[0])}">... ({len(rows)-max_rows} more rows)</td></tr>')
+    html_output.append("</tbody></table>")
+
+    full_csv_table_html = "".join(html_output)
+
+    full_html = f"""
+    <html>
+    <body>
+        <h2>Enhanced AWS Backup Report</h2>
+        <p><strong>Environment:</strong> {html.escape(env)}<br>
+           <strong>Date:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")}<br>
+           <strong>Original file:</strong> {html.escape(original_key)}<br>
+           <strong>Enhanced file:</strong> {html.escape(filename_csv)}</p>
+        <h3>Job Status Summary</h3>
+        {summary_table}
+        <h3>Full Enhanced CSV Table</h3>
+        {full_csv_table_html}
+        <p>This report includes:<br>
+        • Account name enrichment<br>
+        • Standardized date formatting<br>
+        • ARN-aware name extraction<br>
+        • Latest backup-only filtering<br>
+        • ZIP + CSV support</p>
+    </body>
+    </html>
+    """
+    return full_html
+
+def send_email(csv_content: str, filename: str, original_key: str, env: str = "DEV") -> str:
+    msg = MIMEMultipart()
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = ", ".join(RECIPIENTS)
+    msg["Subject"] = f"[{env}] AWS Backup Report (Enhanced) - {datetime.now():%Y-%m-%d}"
+
+    # Email body: preview
+    preview_html = f"""
+    <html>
+    <body>
+        <p><strong>Enhanced AWS Backup Report Preview</strong></p>
+        {generate_status_summary_table(csv_content)}
+        {csv_to_html_table(csv_content, max_rows=50)}
+    </body>
+    </html>
+    """
+    msg.attach(MIMEText(preview_html, "html"))
+
+    # ZIP CSV if size > 2MB
+    csv_bytes = csv_content.encode("utf-8")
+    if len(csv_bytes) > 2 * 1024 * 1024:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+            zipf.writestr(filename, csv_bytes)
+        buffer.seek(0)
+        attachment = MIMEApplication(buffer.read())
+        attachment.add_header("Content-Disposition", "attachment", filename=filename.replace(".csv", ".zip"))
+        msg.attach(attachment)
+    else:
+        attachment = MIMEApplication(csv_bytes)
+        attachment.add_header("Content-Disposition", "attachment", filename=filename)
+        msg.attach(attachment)
+
+    # Attach full HTML report
+    full_html_content = generate_full_html_attachment(csv_content, original_key, filename, env)
+    attachment_html = MIMEApplication(full_html_content.encode("utf-8"))
+    attachment_html.add_header("Content-Disposition", "attachment", filename=filename.replace(".csv", ".html"))
+    msg.attach(attachment_html)
+
+    response = ses.send_raw_email(
+        Source=SENDER_EMAIL,
+        Destinations=RECIPIENTS,
+        RawMessage={"Data": msg.as_string()}
+    )
+
+    return response["MessageId"]
+
+# ----------------------------
+# Lambda Handler
+# ----------------------------
+def lambda_handler(event, context):
+    logger.info("Event received: %s", json.dumps(event))
+
+    summary = {
+        "status": "UNKNOWN",
+        "original_file": None,
+        "enhanced_s3_key": None,
+        "email_sent_to": DEST_EMAIL,
+        "ses_message_id": None,
+        "error": None
+    }
+
+    try:
+        if "Records" in event:
+            rec = event["Records"][0]
+            bucket = rec["s3"]["bucket"]["name"]
+            key = urllib.parse.unquote_plus(rec["s3"]["object"]["key"])
+            mode = "s3_event"
+        elif event.get("mode") == "latest":
+            bucket = event["bucket"]
+            key = get_latest_backup_file(bucket)
+            if not key:
+                summary["status"] = "FAILED"
+                summary["error"] = "No backup report found"
+                logger.error("No backup report found in bucket: %s", bucket)
+                return {"statusCode": 404, "body": "No backup report found"}
+            mode = "latest"
+        else:
+            bucket = event["bucket"]
+            key = event["key"]
+            mode = "direct"
+
+        summary["original_file"] = key
+        logger.info("Processing file: %s (mode=%s)", key, mode)
+
+        if not is_backup_report(key):
+            summary["status"] = "IGNORED"
+            logger.info("File skipped, not a backup report: %s", key)
+            return {"statusCode": 200, "body": "Ignored"}
+
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        raw_bytes = obj["Body"].read()
+        csv_content = extract_csv_from_zip(raw_bytes) if key.lower().endswith(".zip") else raw_bytes.decode("utf-8")
+
+        enhanced_csv = enhance_csv(csv_content)
+
+        date = datetime.now().strftime("%Y-%m-%d")
+        filename = f"aws-cross-account-backup-report-enhanced-{date}.csv"
+        enhanced_key = upload_enhanced_csv(enhanced_csv, filename)
+        summary["enhanced_s3_key"] = enhanced_key
+
+        msg_id = send_email(enhanced_csv, filename, key, env=env)
+        summary["ses_message_id"] = msg_id
+
+        summary["status"] = "SUCCESS"
+        logger.info(
+            "✅ Backup report processing completed ✅\nOriginal file: %s\nEnhanced file S3 key: %s\nEmail sent to: %s\nSES Message ID: %s",
+            summary["original_file"], summary["enhanced_s3_key"], summary["email_sent_to"], summary["ses_message_id"]
+        )
+
+    except Exception as e:
+        summary["status"] = "FAILED"
+        summary["error"] = str(e)
+        logger.error(
+            "❌ Backup report processing FAILED ❌\nOriginal file: %s\nError: %s",
+            summary.get("original_file"), summary["error"]
+        )
+
+    return {
+        "statusCode": 200 if summary["status"] == "SUCCESS" else 500,
+        "summary": summary
+    }
